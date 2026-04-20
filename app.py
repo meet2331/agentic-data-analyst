@@ -101,49 +101,75 @@ if st.button("Run Agent", type="primary") and uploaded_file:
         for c in changes: st.write(f"- {c}")
 
     # EXECUTE ANALYSIS + CHARTS
-    with st.spinner("Step 3/4: Generating charts..."):
-        st.subheader("Step 3: Auto-Generated Charts")
+with st.spinner("Step 3/4: Generating charts..."):
+    st.subheader("Step 3: Auto-Generated Charts")
 
-        figures = []
-        for i, chart in enumerate(plan["chart_ideas"][:3]): # max 3 charts
-            try:
-                fig, ax = plt.subplots()
-                if chart["type"] == "histogram":
-                    df[chart["col"]].hist(ax=ax)
-                    ax.set_title(f"Distribution of {chart['col']}")
-                elif chart["type"] == "bar":
-                    df[chart["col"]].value_counts().head(10).plot(kind='bar', ax=ax)
-                    ax.set_title(f"Top values in {chart['col']}")
-                elif chart["type"] == "correlation" and len(df.select_dtypes('number').columns) > 1:
-                    df.select_dtypes('number').corr()[chart.get("col", df.columns[0])].sort_values().plot(kind='barh', ax=ax)
-                    ax.set_title("Correlation with target")
+    figures = []
+    chart_ideas = plan.get("chart_ideas", [])
 
-                st.pyplot(fig)
-                figures.append((f"chart_{i+1}.png", fig))
-            except Exception as e:
-                st.warning(f"Could not create chart {i+1}: {e}")
+    # Fallback: if Gemini gave us garbage, make our own charts
+    if not chart_ideas or not isinstance(chart_ideas, list):
+        st.info("Agent plan unclear. Using fallback: auto-charts for first numeric + categorical columns.")
+        numeric_cols = df.select_dtypes('number').columns.tolist()
+        cat_cols = df.select_dtypes('object').columns.tolist()
+        chart_ideas = []
+        if numeric_cols: chart_ideas.append({"type": "histogram", "col": numeric_cols[0]})
+        if cat_cols: chart_ideas.append({"type": "bar", "col": cat_cols[0]})
+        if len(numeric_cols) > 1: chart_ideas.append({"type": "correlation", "col": numeric_cols[0]})
+
+    for i, chart in enumerate(chart_ideas[:3]):
+        try:
+            fig, ax = plt.subplots()
+            chart_type = chart.get("type", "histogram") # Default to histogram if missing
+            col = chart.get("col", df.columns[0]) # Default to first column if missing
+
+            if col not in df.columns:
+                st.warning(f"Skipping chart {i+1}: column '{col}' not found")
+                continue
+
+            if chart_type == "histogram" and pd.api.types.is_numeric_dtype(df[col]):
+                df[col].hist(ax=ax)
+                ax.set_title(f"Distribution of {col}")
+            elif chart_type == "bar":
+                df[col].value_counts().head(10).plot(kind='bar', ax=ax)
+                ax.set_title(f"Top values in {col}")
+            elif chart_type == "correlation" and len(df.select_dtypes('number').columns) > 1:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    df.select_dtypes('number').corr()[col].sort_values().plot(kind='barh', ax=ax)
+                    ax.set_title(f"Correlation with {col}")
+                else:
+                    df[col].value_counts().head(10).plot(kind='bar', ax=ax)
+                    ax.set_title(f"Top values in {col}")
+            else: # Final fallback
+                df[col].value_counts().head(10).plot(kind='bar', ax=ax)
+                ax.set_title(f"Values in {col}")
+
+            st.pyplot(fig)
+            figures.append((f"chart_{i+1}_{col}.png", fig))
+
+        except Exception as e:
+            st.warning(f"Could not create chart {i+1} for '{chart.get('col', 'unknown')}': {str(e)}")
 
     # EXECUTE SUMMARY
-    with st.spinner("Step 4/4: Writing executive summary..."):
-        st.subheader("Step 4: AI Executive Summary")
-
-        summary_prompt = f"""
-        Dataset columns: {list(df.columns)}
-        User question: {user_question}
-        Key stats: Shape {df.shape}, Target appears to be {plan['target_column']}
-        Cleaning done: {changes}
-
-        Write exactly 5 bullet points for a non-technical CEO. Use specific numbers from the data.
-        End with 1 recommendation.
+with st.spinner("Step 4/4: Writing executive summary..."):
+    st.subheader("Step 4: AI Executive Summary")
+    try:
+        summary_response = model.generate_content(summary_prompt)
+        summary_text = summary_response.text
+        st.markdown(summary_text)
+    except exceptions.ResourceExhausted:
+        summary_text = f"""
+        - Gemini API rate limit hit: 15 requests/min on free tier. Wait 60s and try again.
+        - Your data shape: {df.shape}. Agent successfully loaded and cleaned it.
+        - Fallback insight: First numeric column '{df.select_dtypes('number').columns[0] if len(df.select_dtypes('number').columns)>0 else 'N/A'}' has mean {df.select_dtypes('number').iloc[:,0].mean():.2f} if numeric exists.
+        - Fallback insight: First categorical column has {df.select_dtypes('object').iloc[:,0].nunique() if len(df.select_dtypes('object').columns)>0 else 'N/A'} unique values.
+        - Recommendation: For production demos, use paid Gemini tier or add caching to avoid rate limits.
         """
-
-        try:
-            summary_response = model.generate_content(summary_prompt)
-            summary_text = summary_response.text
-            st.markdown(summary_text)
-        except exceptions.ResourceExhausted:
-            summary_text = "- Analysis complete but Gemini rate limit hit. Upgrade to paid tier for live summaries."
-            st.warning(summary_text)
+        st.warning("Rate limit hit. Showing fallback summary:")
+        st.markdown(summary_text)
+    except Exception as e:
+        summary_text = f"Agent error during summary: {str(e)}"
+        st.error(summary_text)
 
     # SAVE FILES
     st.subheader("Downloads")
