@@ -12,7 +12,7 @@ st.write("Upload ANY CSV. I clean it, chart it, and summarize it — no hardcodi
 
 # Configure Gemini - uses your Streamlit secret
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel('gemini-1.5-flash') # 15 RPM free tier
+model = genai.GenerativeModel('gemini-2.0-flash') # 15 RPM free tier
 
 uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
 question = st.text_input("What should I analyze?", "What are the key patterns in this data?")
