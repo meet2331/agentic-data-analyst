@@ -1,326 +1,261 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import google.generativeai as genai
 import io
-import numpy as np
+import zipfile
 from datetime import datetime
 from google.api_core import exceptions
 
+# ======================= PAGE CONFIG =======================
 st.set_page_config(page_title="Universal CSV Analyst", layout="wide")
 st.title("Universal CSV Analyst 🤖")
-st.write("Upload ANY CSV. I clean it, chart it, and summarize it — no hardcoding.")
+st.write("Upload ANY CSV. I clean it, chart it, and summarize it — with clear, annotated charts.")
 
-# Configure Gemini - uses your Streamlit secret
+# Configure Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel('gemini-2.0-flash') # 15 RPM free tier
+model = genai.GenerativeModel('gemini-2.0-flash')
 sns.set_style("whitegrid")
 
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-question = st.text_input("What should I analyze?", "What are the key patterns in this data?")
+# ======================= SIDEBAR OPTIONS =======================
+st.sidebar.header("Options")
+cap_outliers_toggle = st.sidebar.toggle("Cap outliers (IQR)", value=True, help="Clips extreme values at Q1-1.5*IQR and Q3+1.5*IQR")
+show_dict = st.sidebar.toggle("Show data dictionary", value=True)
 
-# ===== HELPER FUNCTIONS =====
-def smart_label(col_name, series):
-    """Guess what the numbers represent from name + data"""
+# ======================= HELPER FUNCTIONS =======================
+def infer_unit(col_name: str) -> str:
     col_lower = col_name.lower()
-    if any(k in col_lower for k in ['revenue', 'sales', 'price', 'cost', 'amount', 'income', 'spend']):
-        return 'Amount ($)'
-    elif any(k in col_lower for k in ['age', 'year', 'tenure', 'duration', 'days']):
-        return col_name.title() + ' (Units)'
-    elif any(k in col_lower for k in ['count', 'num', 'qty', 'click', 'view', 'visit', 'impression']):
-        return f'Number of {col_name}'
-    elif series.nunique() == 2 and set(series.unique()).issubset({0, 1, True, False}):
-        return f'{col_name} (0=No, 1=Yes)'
-    elif pd.api.types.is_integer_dtype(series) and 'id' not in col_lower:
-        return f'Count of {col_name}'
-    else:
-        return col_name
+    if 'age' in col_lower: return 'years'
+    if any(k in col_lower for k in ['revenue','sales','price','cost','income','amount']): return 'USD ($)'
+    if any(k in col_lower for k in ['click','visit','impression','count','qty']): return 'count'
+    if any(k in col_lower for k in ['rate','ratio','pct','percent']): return '%'
+    if any(k in col_lower for k in ['time','duration','days']): return 'seconds'
+    return ''
+
+def format_axis_label(col: str, data: pd.Series) -> str:
+    unit = infer_unit(col)
+    max_val = data.max()
+    if pd.isna(max_val): return col
+    if max_val > 1e6: base = f"{col} (millions)"
+    elif max_val > 1e3: base = f"{col} (thousands)"
+    else: base = col
+    return f"{base} ({unit})" if unit else base
+
+def cap_outliers_iqr(series: pd.Series) -> pd.Series:
+    Q1 = series.quantile(0.25)
+    Q3 = series.quantile(0.75)
+    IQR = Q3 - Q1
+    return series.clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)
 
 def pick_best_numeric(df, question):
-    """Pick most interesting numeric column based on question + variance"""
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    if not numeric_cols:
-        return None
-
-    # Priority 1: Mentioned in question
+    if not numeric_cols: return None
     for col in numeric_cols:
-        if col.lower() in question.lower():
-            return col
-
-    # Priority 2: Skip ID-like columns, pick highest coefficient of variation
+        if col.lower() in question.lower(): return col
     candidates = [c for c in numeric_cols if df[c].nunique() > 10 and not c.lower().endswith('id')]
     if candidates:
         cv = df[candidates].std() / df[candidates].mean().replace(0, np.nan)
         return cv.idxmax()
-
-    return numeric_cols[0] if numeric_cols else None
+    return numeric_cols[0]
 
 def pick_best_categorical(df):
-    """Pick categorical with 2-20 unique values, prefer 3-10"""
-    cat_cols = df.select_dtypes('object').columns
-    candidates = [(c, df[c].nunique()) for c in cat_cols if 2 <= df[c].nunique() <= 50]
-    if not candidates:
-        return None
-    # Prefer 3-10 categories as most readable
-    candidates.sort(key=lambda x: abs(x[1] - 6))
-    return candidates[0][0]
+    cat_cols = [c for c in df.select_dtypes('object').columns if 2 <= df[c].nunique() <= 50]
+    if not cat_cols: return None
+    cat_cols.sort(key=lambda x: abs(df[x].nunique() - 6)) # prefer ~6 categories
+    return cat_cols[0]
 
-# ===== MAIN APP =====
+# ======================= MAIN APP =======================
+uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+question = st.text_input("What should I analyze?", "What are the key patterns in this data?")
+
 if st.button("Run Analysis", type="primary") and uploaded_file:
     df = pd.read_csv(uploaded_file)
     df_clean = df.copy()
 
-    # ===== STEP 1: AUTOMATIC CLEANING =====
+    # ---------- STEP 1: CLEANING ----------
     st.subheader("Step 1: Automatic Cleaning")
     changes = []
 
     for col in df_clean.columns:
-        # Auto-detect dates
+        # Boolean detection - improved
+        unique_vals = df_clean[col].dropna().astype(str).str.lower().unique()
+        if set(unique_vals) <= {'0','1','true','false','yes','no','y','n'}:
+            mapping = {'true':1,'false':0,'yes':1,'no':0,'y':1,'n':0,'1':1,'0':0}
+            df_clean[col] = df_clean[col].astype(str).str.lower().map(mapping)
+            changes.append(f"Converted '{col}' to boolean (0/1)")
+            continue
+        # Date detection
         if 'date' in col.lower() or 'time' in col.lower():
             try:
-                df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce')
-                if df_clean[col].notna().sum() > len(df_clean) * 0.5: # Only if >50% parsed
+                parsed = pd.to_datetime(df_clean[col], errors='coerce')
+                if parsed.notna().sum() > len(df_clean)*0.5:
+                    df_clean[col] = parsed
                     changes.append(f"Converted '{col}' to datetime")
                     continue
-                else:
-                    df_clean[col] = df[col] # Revert if mostly NaT
-            except:
-                pass
-
-        # Numeric columns
-        if pd.api.types.is_numeric_dtype(df_clean[col]):
-            nulls = df_clean[col].isnull().sum()
-            if nulls > 0:
-                median = df_clean[col].median()
-                df_clean[col] = df_clean[col].fillna(median)
-                changes.append(f"Filled {nulls} nulls in numeric '{col}' with median {median:.2f}")
-        # Text/categorical columns
-        else:
-            nulls = df_clean[col].isnull().sum()
-            if nulls > 0:
-                mode = df_clean[col].mode()
-                fill_val = mode[0] if not mode.empty else 'Unknown'
-                df_clean[col] = df_clean[col].fillna(fill_val)
-                changes.append(f"Filled {nulls} nulls in text '{col}' with '{fill_val}'")
-
-    # Drop columns with >70% missing
-    cols_to_drop = []
-    for col in df.columns:
-        if df[col].isnull().mean() > 0.7:
-            cols_to_drop.append(col)
-            changes.append(f"Dropped '{col}' (>70% missing)")
-    if cols_to_drop:
-        df_clean = df_clean.drop(columns=cols_to_drop)
-
-    if changes:
-        for c in changes[:8]:
-            st.write(f"- {c}")
-        if len(changes) > 8:
-            st.write(f"-...and {len(changes)-8} more")
-    else:
-        st.write("- No cleaning needed")
-    st.write(f"Shape: {df.shape} → {df_clean.shape}")
-
-    # ===== STEP 2: AUTO CHARTS =====
-    st.subheader("Step 2: Auto Charts")
-    figures = []
+            except: pass
 
     numeric_cols = df_clean.select_dtypes(include=['number']).columns.tolist()
-    datetime_cols = df_clean.select_dtypes(include=['datetime']).columns.tolist()
-    cat_cols = [c for c in df_clean.select_dtypes('object').columns if 2 <= df_clean[c].nunique() < 50]
-    text_cols = [c for c in df_clean.select_dtypes('object').columns if df_clean[c].nunique() >= 50]
+    for col in numeric_cols:
+        if cap_outliers_toggle:
+            before = df_clean[col].copy()
+            df_clean[col] = cap_outliers_iqr(df_clean[col])
+            if not before.equals(df_clean[col]):
+                changes.append(f"Capped outliers in '{col}' using IQR")
+        nulls = df_clean[col].isnull().sum()
+        if nulls > 0:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+            changes.append(f"Filled {nulls} nulls in '{col}' with median")
 
-    # Chart 1: Smart Distribution
+    # Categorical cleaning
+    cat_cols = [c for c in df_clean.select_dtypes('object').columns if df_clean[c].nunique() < 50]
+    for col in cat_cols:
+        df_clean[col] = df_clean[col].astype(str).str.strip().str.title()
+        nulls = df_clean[col].isnull().sum()
+        if nulls > 0:
+            fill = df_clean[col].mode()[0] if not df_clean[col].mode().empty else 'Unknown'
+            df_clean[col] = df_clean[col].fillna(fill)
+            changes.append(f"Filled {nulls} nulls in '{col}' with '{fill}'")
+
+    # Drop >70% missing
+    for col in df.columns:
+        if df[col].isnull().mean() > 0.7:
+            df_clean.drop(columns=[col], inplace=True, errors='ignore')
+            changes.append(f"Dropped '{col}' (>70% missing)")
+
+    for c in changes[:8]: st.write(f"- {c}")
+    st.write(f"Shape: {df.shape} → {df_clean.shape}")
+
+    # ---------- STEP 2: DATA DICTIONARY ----------
+    if show_dict:
+        st.subheader("Data Dictionary")
+        data_dict = pd.DataFrame({
+            'Column': df_clean.columns,
+            'Type': df_clean.dtypes.astype(str),
+            'Inferred Unit': [infer_unit(c) for c in df_clean.columns],
+            'Example': [df_clean[c].iloc[0] if len(df_clean) > 0 else '' for c in df_clean.columns],
+            'Missing %': (df_clean.isnull().mean()*100).round(1)
+        })
+        st.dataframe(data_dict, use_container_width=True)
+
+    # ---------- STEP 3: CHARTS ----------
+    st.subheader("Step 2: Auto Charts")
+    figures = []
+    numeric_cols = df_clean.select_dtypes(include=['number']).columns.tolist()
+    datetime_cols = df_clean.select_dtypes(include=['datetime']).columns.tolist()
+    cat_cols = [c for c in df_clean.select_dtypes('object').columns if 2 <= df_clean[c].nunique() <= 50]
+
     best_num = pick_best_numeric(df_clean, question)
+    best_cat = pick_best_categorical(df_clean)
+
+    # Chart 1: Distribution
     if best_num:
         series = df_clean[best_num].dropna()
-        fig1, ax1 = plt.subplots(figsize=(8, 5))
-
-        if series.nunique() == 2: # Binary data
+        fig1, ax1 = plt.subplots(figsize=(8,5))
+        if series.nunique() == 2:
             counts = series.value_counts().sort_index()
             counts.plot(kind='bar', ax=ax1, color='#1f77b4', edgecolor='black')
-            labels = ['No/0', 'Yes/1'] if set(series.unique()).issubset({0,1}) else [str(i) for i in counts.index]
-            ax1.set_xticklabels(labels, rotation=0)
-            pos_count = counts.get(1, counts.get(True, 0))
-            ax1.set_title(f'{best_num}: {pos_count} Positive ({pos_count/len(series):.0%} of total)')
-        else: # Continuous
-            # Cap outliers at 99th percentile for readability
-            plot_series = series.clip(upper=series.quantile(0.99))
-            plot_series.hist(ax=ax1, bins=min(30, series.nunique()), edgecolor='black', color='#1f77b4')
-            mean_val, median_val = series.mean(), series.median()
-            ax1.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.1f}')
-            ax1.axvline(median_val, color='green', linestyle='--', linewidth=2, label=f'Median: {median_val:.1f}')
+            ax1.set_xticklabels(['No','Yes'], rotation=0)
+            ax1.set_title(f'{best_num}: {counts.get(1,0)} Yes ({counts.get(1,0)/len(series):.0%})', fontweight='bold')
+        else:
+            series.hist(ax=ax1, bins=min(30, series.nunique()), edgecolor='black', color='steelblue', alpha=0.8)
+            ax1.axvline(series.mean(), color='red', linestyle='--', label=f"Mean: {series.mean():.1f}")
+            ax1.axvline(series.median(), color='green', linestyle='-.', label=f"Median: {series.median():.1f}")
             ax1.legend()
-            skew = series.skew()
-            skew_text = "Right-skewed" if skew > 1 else "Left-skewed" if skew < -1 else "Normal"
-            ax1.set_title(f'Distribution of {best_num} | {skew_text}')
-
-        ax1.set_xlabel(smart_label(best_num, series))
+            ax1.set_title(f'Distribution of {best_num}', fontweight='bold')
+        ax1.set_xlabel(format_axis_label(best_num, series))
         ax1.set_ylabel('Frequency')
-        ax1.grid(axis='y', alpha=0.3)
+        ax1.text(0.95,0.95, f"Skew: {series.skew():.2f} | Std: {series.std():.1f}", transform=ax1.transAxes,
+                 ha='right', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=9)
         plt.tight_layout()
         st.pyplot(fig1)
-        st.caption(f"Insight: 75% of values are ≤ {series.quantile(0.75):.1f}. Range: {series.min():.1f} to {series.max():.1f}")
+        st.caption(f"Insight: 75% of values ≤ {series.quantile(0.75):.1f}")
         figures.append((f"dist_{best_num}.png", fig1))
 
-    # Chart 2: Top Categories with Labels
-    best_cat = pick_best_categorical(df_clean)
+    # Chart 2: Bar
     if best_cat:
-        fig2, ax2 = plt.subplots(figsize=(8, 5))
         counts = df_clean[best_cat].value_counts().head(10)
-        total = len(df_clean)
-
+        fig2, ax2 = plt.subplots(figsize=(8,5))
         counts.plot(kind='bar', ax=ax2, color='skyblue', edgecolor='black')
-        ax2.set_title(f'Top {len(counts)} Categories in {best_cat}')
+        ax2.set_title(f'Top {len(counts)} {best_cat}', fontweight='bold')
         ax2.set_xlabel(best_cat)
-        ax2.set_ylabel(f'Number of Records (Total: {total})')
-
-        # Add value + percentage on each bar
-        for i, v in enumerate(counts):
-            ax2.text(i, v + total*0.01, f'{v}\n({v/total:.0%})',
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-
+        ax2.set_ylabel(f'Number of Records (Total: {len(df_clean):,})')
+        for i,v in enumerate(counts):
+            ax2.text(i, v*1.01, f'{v}\n({v/len(df_clean):.0%})', ha='center', va='bottom', fontsize=9)
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
         st.pyplot(fig2)
-        st.caption(f"Insight: '{counts.index[0]}' dominates with {counts.iloc[0]/total:.0%} of all records. Top 3 = {counts.iloc[:3].sum()/total:.0%}")
-        figures.append((f"cat_{best_cat}.png", fig2))
+        st.caption(f"Insight: '{counts.index[0]}' dominates with {counts.iloc[0]/len(df_clean):.0%}")
+        figures.append((f"bar_{best_cat}.png", fig2))
 
-    # Chart 3: Correlation Analysis
+    # Chart 3: Correlation
     if len(numeric_cols) >= 2:
-        fig3, ax3 = plt.subplots(figsize=(9, 6))
-        corr_matrix = df_clean[numeric_cols].corr()
-
-        # If we have a target mentioned in question, do bar chart
-        target = None
-        for col in numeric_cols:
-            if col.lower() in question.lower():
-                target = col
-                break
-
-        if target and len(numeric_cols) > 2:
-            corr_series = corr_matrix[target].drop(target).sort_values()
-            colors = ['#d62728' if x < 0 else '#2ca02c' for x in corr_series]
-            corr_series.plot(kind='barh', ax=ax3, color=colors, edgecolor='black')
-            ax3.axvline(0, color='black', linewidth=1.5)
-            ax3.axvline(0.3, color='green', linestyle=':', linewidth=1, label='Strong positive')
-            ax3.axvline(-0.3, color='red', linestyle=':', linewidth=1, label='Strong negative')
-            ax3.set_title(f'What Correlates with {target}?')
-            ax3.set_xlabel('Correlation Coefficient (-1 to +1)')
-            ax3.legend()
-            st.caption("Insight: Green bars increase with target, red bars decrease. |corr| > 0.3 is noteworthy.")
-        else: # Show heatmap
-            mask = np.triu(np.ones_like(corr_matrix, dtype=bool)) # Hide upper triangle
-            sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=ax3,
-                       fmt='.2f', mask=mask, square=True, linewidths=0.5)
-            ax3.set_title('Correlation Between All Numeric Variables')
-            st.caption("Insight: Red = positive correlation, Blue = negative. Darker = stronger relationship.")
-
+        top_vars = df_clean[numeric_cols].var().nlargest(min(10, len(numeric_cols))).index.tolist()
+        corr = df_clean[top_vars].corr()
+        fig3, ax3 = plt.subplots(figsize=(9,7))
+        mask = np.triu(np.ones_like(corr, dtype=bool))
+        sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax3, square=True)
+        ax3.set_title('Correlation Matrix (Top Variables)', fontweight='bold')
         plt.tight_layout()
         st.pyplot(fig3)
         figures.append(("correlation.png", fig3))
 
-    # Chart 4: Time Series if available
-    if datetime_cols:
+    # Chart 4: Time series - FIXED resample
+    if datetime_cols and best_num:
         date_col = datetime_cols[0]
-        fig4, ax4 = plt.subplots(figsize=(10, 4))
-        ts = df_clean.set_index(date_col).resample('ME').size()
-        ts.plot(ax=ax4, marker='o', color='#2ca02c')
-        ax4.set_title(f'Records Over Time by {date_col}')
-        ax4.set_xlabel('Month')
-        ax4.set_ylabel('Records per Month')
-        ax4.grid(alpha=0.3)
+        df_temp = df_clean.set_index(date_col).resample('1D').mean(numeric_only=True).reset_index()
+        fig4, ax4 = plt.subplots(figsize=(10,4))
+        ax4.plot(df_temp[date_col], df_temp[best_num], alpha=0.5, label='Daily')
+        rolling = df_temp[best_num].rolling(7, center=True).mean()
+        ax4.plot(df_temp[date_col], rolling, color='red', linewidth=2, label='7-day trend')
+        ax4.set_title(f'{best_num} over time', fontweight='bold')
+        ax4.set_ylabel(format_axis_label(best_num, df_temp[best_num]))
+        ax4.legend()
+        max_idx = df_temp[best_num].idxmax()
+        ax4.annotate(f"Peak: {df_temp.loc[max_idx, best_num]:.0f}",
+                     xy=(df_temp.loc[max_idx, date_col], df_temp.loc[max_idx, best_num]),
+                     xytext=(0,15), textcoords='offset points', ha='center',
+                     arrowprops=dict(arrowstyle='->'))
         plt.tight_layout()
         st.pyplot(fig4)
-        peak_month = ts.idxmax().strftime('%b %Y')
-        st.caption(f"Insight: Peak activity in {peak_month} with {ts.max()} records. Avg: {ts.mean():.0f}/month")
-        figures.append((f"time_{date_col}.png", fig4))
+        figures.append((f"timeseries.png", fig4))
 
-    if text_cols:
-        st.info(f"Skipped {len(text_cols)} high-cardinality text columns: {', '.join(text_cols[:3])}")
-
-    # ===== STEP 3: AI SUMMARY =====
+    # ---------- STEP 4: AI SUMMARY WITH SAMPLE ROWS ----------
     st.subheader("Step 3: AI Summary")
-
-    stats_parts = []
-    stats_parts.append(f"{len(df_clean)} rows, {len(df_clean.columns)} columns")
-    if best_num:
-        stats_parts.append(f"'{best_num}' avg {df_clean[best_num].mean():.1f}, median {df_clean[best_num].median():.1f}")
+    stats_parts = [f"{len(df_clean)} rows, {len(df_clean.columns)} cols"]
+    if best_num: stats_parts.append(f"'{best_num}' mean {df_clean[best_num].mean():.1f}")
     if best_cat:
-        top_val = df_clean[best_cat].mode()[0]
-        top_count = df_clean[best_cat].value_counts().iloc[0]
-        stats_parts.append(f"top '{best_cat}' = '{top_val}' ({top_count} times, {top_count/len(df_clean):.0%})")
-    if datetime_cols:
-        start = df_clean[datetime_cols[0]].min().date()
-        end = df_clean[datetime_cols[0]].max().date()
-        stats_parts.append(f"date range {start} to {end}")
-
+        top = df_clean[best_cat].value_counts().iloc[0]
+        stats_parts.append(f"top {best_cat} = {df_clean[best_cat].mode()[0]} ({top/len(df_clean):.0%})")
     stats = ". ".join(stats_parts) + "."
-    prompt = f"""Question: {question}
-Data summary: {stats}
-Numeric columns: {numeric_cols[:5]}
-Categorical columns: {cat_cols[:5]}
 
-Write 5 short bullet points for a business manager. Use specific numbers from the data. Start each with an action verb. End with 'Recommendation:' and one concrete next step."""
+    sample_text = df_clean.head(3).to_csv(index=False) # CSV is cleaner for LLM
+
+    prompt = f"""Question: {question}
+Data: {stats}
+Sample rows:
+{sample_text}
+
+Write 5 bullet points for a manager. Use numbers. End with 'Recommendation:' and one concrete action."""
 
     try:
-        response = model.generate_content(prompt)
-        summary = response.text
+        summary = model.generate_content(prompt).text
     except exceptions.ResourceExhausted:
-        summary = f"""- Dataset contains {len(df_clean)} records across {len(df_clean.columns)} fields.
-- {stats_parts[1] if len(stats_parts) > 1 else 'Analysis complete.'}
-- {stats_parts[2] if len(stats_parts) > 2 else ''}
-- Gemini rate limit hit (15 req/min free tier). Statistical summary shown.
-- Recommendation: Re-run in 60 seconds for full AI insights, or explore charts above."""
-        st.warning("Using statistical fallback - wait 60s between runs for AI.")
+        summary = f"- {stats_parts[0]}\n- Gemini limit hit. Wait 60s.\n- Recommendation: Review charts above."
+        st.warning("Using fallback - rate limit")
     except Exception as e:
-        summary = f"Error generating summary: {str(e)}"
-        st.error(summary)
-
+        summary = f"Error: {e}"
     st.markdown(summary)
 
-    # ===== DOWNLOADS =====
+    # ---------- DOWNLOADS ----------
     st.subheader("Downloads")
-    report = f"""# Analysis Report
-File: {uploaded_file.name}
-Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-## Summary
-{summary}
-
-## Cleaning Log
-""" + "\n".join([f"- {c}" for c in changes]) + f"""
-
-## Columns Analyzed
-Numeric: {', '.join(numeric_cols)}
-Categorical: {', '.join(cat_cols)}
-Datetime: {', '.join(datetime_cols)}
-"""
-
-    st.download_button(
-        "Download report.md",
-        report.encode(),
-        file_name=f"report_{uploaded_file.name.split('.')[0]}.md",
-        mime="text/markdown"
-    )
-
+    report = f"# Report\nFile: {uploaded_file.name}\nDate: {datetime.now():%Y-%m-%d %H:%M}\n\n## Summary\n{summary}\n\n## Cleaning\n" + "\n".join(f"- {c}" for c in changes)
+    st.download_button("Download report.md", report.encode(), f"report_{uploaded_file.name.split('.')[0]}.md")
     if figures:
-        zip_buf = io.BytesIO()
-        import zipfile
-        with zipfile.ZipFile(zip_buf, 'w') as zf:
-            for name, fig in figures:
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-                zf.writestr(name, buf.getvalue())
-        st.download_button(
-            "Download charts.zip",
-            zip_buf.getvalue(),
-            file_name="charts.zip",
-            mime="application/zip"
-        )
-
-    st.success("✅ Analysis complete — works on any CSV!")
-
-elif uploaded_file is None:
-    st.info("👆 Upload a CSV file to begin analysis")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf,'w') as zf:
+            for name,fig in figures:
+                b = io.BytesIO(); fig.savefig(b, format='png', dpi=150, bbox_inches='tight'); zf.writestr(name, b.getvalue())
+        st.download_button("Download charts.zip", buf.getvalue(), "charts.zip")
+    st.success("✅ Analysis complete!")
