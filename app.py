@@ -225,7 +225,7 @@ if st.button("Run Analysis", type="primary") and uploaded_file:
     if datetime_cols:
         date_col = datetime_cols[0]
         fig4, ax4 = plt.subplots(figsize=(10, 4))
-        ts = df_clean.set_index(date_col).resample('M').size()
+        ts = df_clean.set_index(date_col).resample('ME').size()
         ts.plot(ax=ax4, marker='o', color='#2ca02c')
         ax4.set_title(f'Records Over Time by {date_col}')
         ax4.set_xlabel('Month')
